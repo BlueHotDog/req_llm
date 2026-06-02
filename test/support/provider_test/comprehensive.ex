@@ -2,16 +2,9 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
   @moduledoc """
   Comprehensive per-model provider tests.
 
-  Consolidates all provider capability testing into up to 9 focused tests per model:
-  1. Basic generate_text (non-streaming)
-  2. Streaming with system context + creative params
-  3. Token limit constraints
-  4. Usage metrics and cost calculations
-  5. Tool calling - multi-tool selection
-  6. Tool calling - no tool when inappropriate
-  7. Object generation (non-streaming) - only for models with object generation support
-  8. Object generation (streaming) - only for models with object generation support
-  9. Reasoning/thinking tokens - only for models with :reasoning capability
+  Generates registry-backed provider scenarios for each selected text model.
+  Scenario modules own prompts, fixture names, capability applicability, and
+  assertions; this macro owns ExUnit model/provider/scenario tags.
 
   Tests use fixtures for fast, deterministic execution while supporting
   live API recording with REQ_LLM_FIXTURES_MODE=record.
@@ -30,82 +23,30 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
   """
 
   def supports_object_generation?(model_spec) do
-    case ReqLLM.model(model_spec) do
-      {:ok, model} ->
-        caps = model.capabilities || %{}
-
-        # Object generation is supported if:
-        # 1. Model has native JSON mode (json.native)
-        # 2. Model supports JSON schemas (json.schema)
-        # 3. Model has strict tool calling (tools.strict = true)
-        # 4. Model has regular tool calling (tools.enabled = true) - req_llm has workaround
-        structured_outputs_supported?(model) and
-          (get_in(caps, [:json, :native]) ||
-             get_in(caps, [:json, :schema]) ||
-             get_in(caps, [:tools, :strict]) == true ||
-             get_in(caps, [:tools, :enabled]) == true)
-
-      {:error, _} ->
-        false
-    end
+    ReqLLM.Test.Scenarios.Capabilities.supports_object_generation?(model_spec)
   end
 
   def supports_streaming_object_generation?(model_spec) do
-    case ReqLLM.model(model_spec) do
-      {:ok, model} ->
-        caps = model.capabilities || %{}
-
-        # Must support object generation AND streaming tool calls
-        supports_object = supports_object_generation?(model_spec)
-        supports_streaming = get_in(caps, [:streaming, :tool_calls]) != false
-
-        supports_object && supports_streaming
-
-      {:error, _} ->
-        false
-    end
+    ReqLLM.Test.Scenarios.Capabilities.supports_streaming_object_generation?(model_spec)
   end
 
   def supports_tool_calling?(model_spec) do
-    case ReqLLM.model(model_spec) do
-      {:ok, model} -> get_in(model.capabilities, [:tools, :enabled]) == true
-      {:error, _} -> false
-    end
+    ReqLLM.Test.Scenarios.Capabilities.supports_tool_calling?(model_spec)
   end
 
   def supports_reasoning?(model_spec) do
-    case ReqLLM.model(model_spec) do
-      {:ok, model} -> get_in(model.capabilities, [:reasoning, :enabled]) == true
-      {:error, _} -> false
-    end
+    ReqLLM.Test.Scenarios.Capabilities.supports_reasoning?(model_spec)
   end
 
   def supports_forced_tool_choice?(model_spec) do
-    case ReqLLM.model(model_spec) do
-      {:ok, model} -> get_in(model.capabilities, [:tools, :forced_choice]) != false
-      {:error, _} -> true
-    end
+    ReqLLM.Test.Scenarios.Capabilities.supports_forced_tool_choice?(model_spec)
   end
-
-  defp structured_outputs_supported?(%LLMDB.Model{provider: :anthropic, extra: extra}) do
-    case get_in(extra || %{}, [:capabilities, :structured_outputs, :supported]) do
-      false -> false
-      _ -> true
-    end
-  end
-
-  defp structured_outputs_supported?(_model), do: true
 
   defmacro __using__(opts) do
     provider = Keyword.fetch!(opts, :provider)
 
     quote bind_quoted: [provider: provider] do
       use ExUnit.Case, async: false
-
-      import ExUnit.Case
-      import ReqLLM.Context
-      import ReqLLM.Debug, only: [dbug: 2]
-      import ReqLLM.Test.Helpers
 
       alias ReqLLM.Test.ModelMatrix
 
@@ -124,121 +65,23 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
       for model_spec <- @models do
         @model_spec model_spec
 
+        {:ok, model} = ReqLLM.model(model_spec)
+        scenario_modules = ReqLLM.Test.Scenarios.for_model(model)
+
         describe "#{model_spec}" do
           @describetag model: model_spec |> String.split(":", parts: 2) |> List.last()
 
-          @tag scenario: :basic
-          test "basic generate_text (non-streaming)" do
-            ReqLLM.Test.Scenario.execute(
-              ReqLLM.Test.Scenarios.Basic,
-              @model_spec,
-              provider: @provider
-            )
-            |> ReqLLM.Test.Scenario.assert_result!()
-          end
+          for scenario_module <- scenario_modules do
+            @scenario_module scenario_module
+            @tag scenario: scenario_module.id()
 
-          @tag scenario: :streaming
-          test "stream_text with system context and creative params" do
-            ReqLLM.Test.Scenario.execute(
-              ReqLLM.Test.Scenarios.Streaming,
-              @model_spec,
-              provider: @provider
-            )
-            |> ReqLLM.Test.Scenario.assert_result!()
-          end
-
-          @tag scenario: :token_limit
-          @tag timeout: 600_000
-          test "token limit constraints" do
-            ReqLLM.Test.Scenario.execute(
-              ReqLLM.Test.Scenarios.TokenLimit,
-              @model_spec,
-              provider: @provider
-            )
-            |> ReqLLM.Test.Scenario.assert_result!()
-          end
-
-          @tag scenario: :usage
-          test "usage metrics and cost calculations" do
-            ReqLLM.Test.Scenario.execute(
-              ReqLLM.Test.Scenarios.Usage,
-              @model_spec,
-              provider: @provider
-            )
-            |> ReqLLM.Test.Scenario.assert_result!()
-          end
-
-          @tag scenario: :context_append
-          test "context append continues conversation" do
-            ReqLLM.Test.Scenario.execute(
-              ReqLLM.Test.Scenarios.ContextAppend,
-              @model_spec,
-              provider: @provider
-            )
-            |> ReqLLM.Test.Scenario.assert_result!()
-          end
-
-          if ReqLLM.ProviderTest.Comprehensive.supports_tool_calling?(model_spec) do
-            @tag scenario: :tool_multi
-            test "tool calling - multi-tool selection" do
-              ReqLLM.Test.Scenario.execute(
-                ReqLLM.Test.Scenarios.ToolMulti,
-                @model_spec,
-                provider: @provider
-              )
-              |> ReqLLM.Test.Scenario.assert_result!()
+            if scenario_module.id() == :token_limit do
+              @tag timeout: 600_000
             end
 
-            @tag scenario: :tool_round_trip
-            test "tool calling - round trip execution" do
+            test scenario_module.name() do
               ReqLLM.Test.Scenario.execute(
-                ReqLLM.Test.Scenarios.ToolRoundTrip,
-                @model_spec,
-                provider: @provider
-              )
-              |> ReqLLM.Test.Scenario.assert_result!()
-            end
-
-            @tag scenario: :tool_none
-            test "tool calling - no tool when inappropriate" do
-              ReqLLM.Test.Scenario.execute(
-                ReqLLM.Test.Scenarios.ToolNone,
-                @model_spec,
-                provider: @provider
-              )
-              |> ReqLLM.Test.Scenario.assert_result!()
-            end
-          end
-
-          if ReqLLM.ProviderTest.Comprehensive.supports_object_generation?(model_spec) do
-            @tag scenario: :object_basic
-            test "object generation (non-streaming)" do
-              ReqLLM.Test.Scenario.execute(
-                ReqLLM.Test.Scenarios.ObjectBasic,
-                @model_spec,
-                provider: @provider
-              )
-              |> ReqLLM.Test.Scenario.assert_result!()
-            end
-          end
-
-          if ReqLLM.ProviderTest.Comprehensive.supports_streaming_object_generation?(model_spec) do
-            @tag scenario: :object_streaming
-            test "object generation (streaming)" do
-              ReqLLM.Test.Scenario.execute(
-                ReqLLM.Test.Scenarios.ObjectStreaming,
-                @model_spec,
-                provider: @provider
-              )
-              |> ReqLLM.Test.Scenario.assert_result!()
-            end
-          end
-
-          if ReqLLM.ProviderTest.Comprehensive.supports_reasoning?(model_spec) do
-            @tag scenario: :reasoning
-            test "reasoning/thinking tokens (non-streaming + streaming)" do
-              ReqLLM.Test.Scenario.execute(
-                ReqLLM.Test.Scenarios.Reasoning,
+                @scenario_module,
                 @model_spec,
                 provider: @provider
               )
